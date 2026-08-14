@@ -380,11 +380,11 @@ fn print_stats(root: &Handle) {
     println!();
 }
 
-fn attr(info: &ElementInfo, name: &str) -> Option<&str> {
+fn attr(info: &ElementInfo, name: &str) -> Option<String> {
     info.attrs
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
+        .map(|(_, v)| v.clone())
 }
 
 fn print_forms(root: &Handle, color: bool) {
@@ -397,8 +397,8 @@ fn print_forms(root: &Handle, color: bool) {
         if let Some(info) = element_info(n) {
             if info.tag == "form" {
                 count += 1;
-                let method = attr(info, "method").unwrap_or("GET");
-                let action = attr(info, "action").unwrap_or("(current URL)");
+                let method = attr(&info, "method").unwrap_or_else(|| "GET".to_string());
+                let action = attr(&info, "action").unwrap_or_else(|| "(current URL)".to_string());
                 println!("FORM #{}", count);
                 println!("  method : {}", method.to_uppercase());
                 println!("  action : {action}");
@@ -413,8 +413,8 @@ fn print_forms(root: &Handle, color: bool) {
                 });
 
                 for input in inputs {
-                    let name = attr(&input, "name").unwrap_or("(unnamed)");
-                    let typ = attr(&input, "type").unwrap_or(&input.tag);
+                    let name = attr(&input, "name").unwrap_or_else(|| "(unnamed)".to_string());
+                    let typ = attr(&input, "type").unwrap_or_else(|| input.tag.clone());
                     println!("    ├── {name} [{typ}]");
                 }
                 println!();
@@ -436,7 +436,7 @@ fn print_links(root: &Handle, _color: bool) {
     walk(root, &mut |n| {
         if let Some(info) = element_info(n) {
             if info.tag == "a" {
-                if let Some(href) = attr(info, "href") {
+                if let Some(href) = attr(&info, "href") {
                     println!("  {href}");
                     found = true;
                 }
@@ -460,7 +460,7 @@ fn print_scripts(root: &Handle, _color: bool) {
         if let Some(info) = element_info(n) {
             if info.tag == "script" {
                 found = true;
-                if let Some(src) = attr(info, "src") {
+                if let Some(src) = attr(&info, "src") {
                     println!("  external : {src}");
                 } else {
                     let inline = text_content(n).trim().replace('\n', " ");
