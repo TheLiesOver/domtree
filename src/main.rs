@@ -4,7 +4,10 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Write, IsTerminal},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
@@ -22,12 +25,13 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
         .multiple(true)
 ))]
 struct Args {
-    /// HTML file. If omitted, read from stdin.
-    file: Option<String>,
+    /// HTML file path or URL (e.g., https://example.com). If omitted, read from stdin.
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
 
-    /// Enable syntax-like colors.
+    /// Disable colors in output.
     #[arg(long)]
-    color: bool,
+    no_color: bool,
 
     /// Show text nodes.
     #[arg(long)]
@@ -36,6 +40,10 @@ struct Args {
     /// Show HTML comments.
     #[arg(long)]
     comments: bool,
+
+    /// Show attributes for found elements.
+    #[arg(long)]
+    attrs: bool,
 
     /// Maximum DOM depth.
     #[arg(long)]
@@ -80,15 +88,19 @@ struct ElementInfo {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let color_choice = if args.no_color {
+        ColorChoice::Never
+    } else {
+        ColorChoice::Auto
+    };
 
-    let input = read_input(args.file.as_deref())?;
+    let input = read_input(args.target.as_deref())?;
     if input.trim().is_empty() {
-        eprintln!("domtree: input is empty");
+        eprintln!("domtree: Error - Input is empty. Please provide HTML content.");
         std::process::exit(1);
     }
 
     let dom = parse_document(RcDom::default(), Default::default()).one(input);
-    let color = args.color;
 
     let do_ctf = args.ctf;
     let show_tree = !do_ctf
@@ -99,11 +111,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !args.stats;
 
     if show_tree {
-        let mut out = StandardStream::stdout(if color {
-            ColorChoice::Auto
-        } else {
-            ColorChoice::Never
-        });
+        if let Some(target_str) = &args.target {
+            println!("{}", target_str);
+        }
+
+        let mut out = StandardStream::stdout(color_choice);
 
         let nodes: Vec<_> = dom
             .document
@@ -122,40 +134,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i + 1 == nodes.len(),
                 0,
                 &args,
+                color_choice,
             )?;
         }
     }
 
     if let Some(query) = args.find.as_deref() {
-        find_elements(&dom.document, query, args.path, color)?;
+        find_elements(&dom.document, query, args.path, args.attrs, color_choice)?;
     }
 
     if args.stats || do_ctf {
-        print_stats(&dom.document);
+        print_stats(&dom.document, color_choice)?;
     }
 
     if args.forms || do_ctf {
-        print_forms(&dom.document, color);
+        print_forms(&dom.document, color_choice)?;
     }
 
     if args.links || do_ctf {
-        print_links(&dom.document, color);
+        print_links(&dom.document, color_choice)?;
     }
 
     if args.scripts || do_ctf {
-        print_scripts(&dom.document, color);
+        print_scripts(&dom.document, color_choice)?;
     }
 
     Ok(())
 }
 
-fn read_input(file: Option<&str>) -> io::Result<String> {
-    match file {
-        Some(path) => fs::read_to_string(path),
+fn read_input(target: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    match target {
+        Some(path_or_url) => {
+            if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()?;
+                let response = client.get(path_or_url).send()?;
+                if !response.status().is_success() {
+                    return Err(format!("Failed to fetch URL. HTTP Status: {}", response.status()).into());
+                }
+                Ok(response.text()?)
+            } else {
+                Ok(fs::read_to_string(path_or_url)?)
+            }
+        }
         None => {
-            let mut s = String::new();
-            io::stdin().read_to_string(&mut s)?;
-            Ok(s)
+            if io::stdin().is_terminal() {
+                return Err("No input provided. Try piping HTML, or provide a file path or URL (e.g., `domtree https://example.com`).".into());
+            }
+
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut s = String::new();
+                let res = io::stdin().read_to_string(&mut s);
+                let _ = tx.send((res, s));
+            });
+
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok((Ok(_), s)) => {
+                    if s.trim().is_empty() {
+                        return Err("Stdin received empty content. Check if the piped command produced output.".into());
+                    }
+                    Ok(s)
+                }
+                Ok((Err(e), _)) => Err(Box::new(e)),
+                Err(_) => Err("Timeout reading from stdin. The piped command (like curl) took too long to respond or did not send data.".into()),
+            }
         }
     }
 }
@@ -211,35 +255,42 @@ fn label(info: &ElementInfo) -> String {
     s
 }
 
-fn print_label(out: &mut StandardStream, info: &ElementInfo, color: bool) -> io::Result<()> {
-    if !color {
+fn print_label(out: &mut StandardStream, info: &ElementInfo, color_choice: ColorChoice) -> io::Result<()> {
+    if color_choice == ColorChoice::Never {
         write!(out, "{}", info.tag)?;
     } else {
         let mut spec = ColorSpec::new();
         spec.set_fg(Some(Color::Cyan));
         out.set_color(&spec)?;
         write!(out, "{}", info.tag)?;
+        out.reset()?;
     }
 
     if let Some(id) = &info.id {
-        if color {
+        if color_choice != ColorChoice::Never {
             let mut spec = ColorSpec::new();
             spec.set_fg(Some(Color::Yellow));
             out.set_color(&spec)?;
         }
         write!(out, "#{id}")?;
+        if color_choice != ColorChoice::Never {
+            out.reset()?;
+        }
     }
 
     for class in &info.classes {
-        if color {
+        if color_choice != ColorChoice::Never {
             let mut spec = ColorSpec::new();
             spec.set_fg(Some(Color::Green));
             out.set_color(&spec)?;
         }
         write!(out, ".{class}")?;
+        if color_choice != ColorChoice::Never {
+            out.reset()?;
+        }
     }
 
-    out.reset()
+    Ok(())
 }
 
 fn render(
@@ -249,6 +300,7 @@ fn render(
     last: bool,
     depth: usize,
     args: &Args,
+    color_choice: ColorChoice,
 ) -> io::Result<()> {
     if let Some(max) = args.depth {
         if depth > max {
@@ -262,27 +314,31 @@ fn render(
     match &node.data {
         NodeData::Element { .. } => {
             if let Some(info) = element_info(node) {
-                print_label(out, &info, args.color)?;
+                print_label(out, &info, color_choice)?;
             }
         }
         NodeData::Text { contents } => {
             let text = contents.borrow().trim().replace('\n', " ");
-            if args.color {
+            if color_choice != ColorChoice::Never {
                 let mut spec = ColorSpec::new();
                 spec.set_fg(Some(Color::White));
                 out.set_color(&spec)?;
             }
             write!(out, "\"{text}\"")?;
-            out.reset()?;
+            if color_choice != ColorChoice::Never {
+                out.reset()?;
+            }
         }
         NodeData::Comment { contents } => {
-            if args.color {
+            if color_choice != ColorChoice::Never {
                 let mut spec = ColorSpec::new();
                 spec.set_fg(Some(Color::Magenta));
                 out.set_color(&spec)?;
             }
             write!(out, "<!-- {} -->", contents)?;
-            out.reset()?;
+            if color_choice != ColorChoice::Never {
+                out.reset()?;
+            }
         }
         _ => {}
     }
@@ -311,6 +367,7 @@ fn render(
             i + 1 == children.len(),
             depth + 1,
             args,
+            color_choice,
         )?;
     }
 
@@ -325,7 +382,8 @@ fn walk<F: FnMut(&Handle)>(node: &Handle, f: &mut F) {
     }
 }
 
-fn print_stats(root: &Handle) {
+fn print_stats(root: &Handle, color_choice: ColorChoice) -> io::Result<()> {
+    let mut out = StandardStream::stdout(color_choice);
     let mut elements = 0usize;
     let mut ids = 0usize;
     let mut classes = 0usize;
@@ -361,23 +419,43 @@ fn print_stats(root: &Handle) {
     });
     depth(root, 0, &mut max_depth);
 
-    println!("DOM Statistics");
-    println!("──────────────");
-    println!("Elements : {elements}");
-    println!("IDs      : {ids}");
-    println!("Classes  : {classes}");
-    println!("Scripts  : {scripts}");
-    println!("Forms    : {forms}");
-    println!("Links    : {links}");
-    println!("Inputs   : {inputs}");
-    println!("Depth    : {max_depth}");
-    println!();
-    println!("Tags:");
+    if color_choice != ColorChoice::Never {
+        let mut spec = ColorSpec::new();
+        spec.set_bold(true);
+        spec.set_fg(Some(Color::Cyan));
+        out.set_color(&spec)?;
+    }
+    writeln!(out, "DOM Statistics")?;
+    if color_choice != ColorChoice::Never {
+        out.reset()?;
+    }
+    writeln!(out, "──────────────")?;
+    writeln!(out, "Elements : {elements}")?;
+    writeln!(out, "IDs      : {ids}")?;
+    writeln!(out, "Classes  : {classes}")?;
+    writeln!(out, "Scripts  : {scripts}")?;
+    writeln!(out, "Forms    : {forms}")?;
+    writeln!(out, "Links    : {links}")?;
+    writeln!(out, "Inputs   : {inputs}")?;
+    writeln!(out, "Depth    : {max_depth}")?;
+    writeln!(out)?;
+
+    if color_choice != ColorChoice::Never {
+        let mut spec = ColorSpec::new();
+        spec.set_bold(true);
+        spec.set_fg(Some(Color::Yellow));
+        out.set_color(&spec)?;
+    }
+    writeln!(out, "Tags:")?;
+    if color_choice != ColorChoice::Never {
+        out.reset()?;
+    }
 
     for (tag, count) in tags {
-        println!("  {tag:<16} {count}");
+        writeln!(out, "  {tag:<16} {count}")?;
     }
-    println!();
+    writeln!(out)?;
+    Ok(())
 }
 
 fn attr<'a>(info: &'a ElementInfo, name: &str) -> Option<&'a str> {
@@ -387,9 +465,20 @@ fn attr<'a>(info: &'a ElementInfo, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-fn print_forms(root: &Handle, color: bool) {
-    println!("Forms");
-    println!("─────");
+fn print_forms(root: &Handle, color_choice: ColorChoice) -> io::Result<()> {
+    let mut out = StandardStream::stdout(color_choice);
+
+    if color_choice != ColorChoice::Never {
+        let mut spec = ColorSpec::new();
+        spec.set_bold(true);
+        spec.set_fg(Some(Color::Cyan));
+        out.set_color(&spec)?;
+    }
+    writeln!(out, "Forms")?;
+    if color_choice != ColorChoice::Never {
+        out.reset()?;
+    }
+    writeln!(out, "─────")?;
 
     let mut count = 0usize;
 
@@ -399,9 +488,10 @@ fn print_forms(root: &Handle, color: bool) {
                 count += 1;
                 let method = attr(&info, "method").unwrap_or("GET");
                 let action = attr(&info, "action").unwrap_or("(current URL)");
-                println!("FORM #{}", count);
-                println!("  method : {}", method.to_uppercase());
-                println!("  action : {action}");
+                
+                let _ = writeln!(out, "FORM #{}", count);
+                let _ = writeln!(out, "  method : {}", method.to_uppercase());
+                let _ = writeln!(out, "  action : {action}");
 
                 let mut inputs = Vec::new();
                 collect_descendants(n, &mut |x| {
@@ -415,29 +505,40 @@ fn print_forms(root: &Handle, color: bool) {
                 for input in inputs {
                     let name = attr(&input, "name").unwrap_or("(unnamed)");
                     let typ = attr(&input, "type").unwrap_or(&input.tag);
-                    println!("    ├── {name} [{typ}]");
+                    let _ = writeln!(out, "    ├── {name} [{typ}]");
                 }
-                println!();
+                let _ = writeln!(out);
             }
         }
     });
 
     if count == 0 {
-        println!("No forms found.\n");
+        writeln!(out, "No forms found.\n")?;
     }
-    let _ = color;
+    Ok(())
 }
 
-fn print_links(root: &Handle, _color: bool) {
-    println!("Links");
-    println!("─────");
+fn print_links(root: &Handle, color_choice: ColorChoice) -> io::Result<()> {
+    let mut out = StandardStream::stdout(color_choice);
+
+    if color_choice != ColorChoice::Never {
+        let mut spec = ColorSpec::new();
+        spec.set_bold(true);
+        spec.set_fg(Some(Color::Cyan));
+        out.set_color(&spec)?;
+    }
+    writeln!(out, "Links")?;
+    if color_choice != ColorChoice::Never {
+        out.reset()?;
+    }
+    writeln!(out, "─────")?;
 
     let mut found = false;
     walk(root, &mut |n| {
         if let Some(info) = element_info(n) {
             if info.tag == "a" {
                 if let Some(href) = attr(&info, "href") {
-                    println!("  {href}");
+                    let _ = writeln!(out, "  {href}");
                     found = true;
                 }
             }
@@ -445,14 +546,26 @@ fn print_links(root: &Handle, _color: bool) {
     });
 
     if !found {
-        println!("  No links found");
+        writeln!(out, "  No links found")?;
     }
-    println!();
+    writeln!(out)?;
+    Ok(())
 }
 
-fn print_scripts(root: &Handle, _color: bool) {
-    println!("JavaScript");
-    println!("──────────");
+fn print_scripts(root: &Handle, color_choice: ColorChoice) -> io::Result<()> {
+    let mut out = StandardStream::stdout(color_choice);
+
+    if color_choice != ColorChoice::Never {
+        let mut spec = ColorSpec::new();
+        spec.set_bold(true);
+        spec.set_fg(Some(Color::Cyan));
+        out.set_color(&spec)?;
+    }
+    writeln!(out, "JavaScript")?;
+    if color_choice != ColorChoice::Never {
+        out.reset()?;
+    }
+    writeln!(out, "──────────")?;
 
     let mut found = false;
 
@@ -461,20 +574,21 @@ fn print_scripts(root: &Handle, _color: bool) {
             if info.tag == "script" {
                 found = true;
                 if let Some(src) = attr(&info, "src") {
-                    println!("  external : {src}");
+                    let _ = writeln!(out, "  external : {src}");
                 } else {
                     let inline = text_content(n).trim().replace('\n', " ");
                     let preview: String = inline.chars().take(100).collect();
-                    println!("  inline   : {}", if preview.is_empty() { "(empty)" } else { &preview });
+                    let _ = writeln!(out, "  inline   : {}", if preview.is_empty() { "(empty)" } else { &preview });
                 }
             }
         }
     });
 
     if !found {
-        println!("  No scripts found");
+        writeln!(out, "  No scripts found")?;
     }
-    println!();
+    writeln!(out)?;
+    Ok(())
 }
 
 fn collect_descendants<F: FnMut(&Handle)>(root: &Handle, f: &mut F) {
@@ -496,7 +610,7 @@ fn text_content(node: &Handle) -> String {
     out
 }
 
-fn find_elements(root: &Handle, query: &str, show_path: bool, color: bool) -> io::Result<()> {
+fn find_elements(root: &Handle, query: &str, show_path: bool, show_attrs: bool, color_choice: ColorChoice) -> io::Result<()> {
     let mut matches = Vec::<Handle>::new();
 
     walk(root, &mut |n| {
@@ -514,11 +628,7 @@ fn find_elements(root: &Handle, query: &str, show_path: bool, color: bool) -> io
         return Ok(());
     }
 
-    let mut out = StandardStream::stdout(if color {
-        ColorChoice::Auto
-    } else {
-        ColorChoice::Never
-    });
+    let mut out = StandardStream::stdout(color_choice);
 
     for node in matches {
         if show_path {
@@ -531,8 +641,14 @@ fn find_elements(root: &Handle, query: &str, show_path: bool, color: bool) -> io
             }
             println!();
         } else if let Some(info) = element_info(&node) {
-            print_label(&mut out, &info, color)?;
+            print_label(&mut out, &info, color_choice)?;
             writeln!(out)?;
+            
+            if show_attrs && !info.attrs.is_empty() {
+                for (k, v) in &info.attrs {
+                    writeln!(out, "    ├── {} = \"{}\"", k, v)?;
+                }
+            }
         }
     }
 
@@ -548,8 +664,8 @@ fn matches_query(info: &ElementInfo, q: &str) -> bool {
         return info.classes.iter().any(|c| c == class);
     }
 
-    let mut rest = q;
-    let mut wanted_tag = None;
+    let rest = q;
+    let wanted_tag;
     let mut wanted_id = None;
     let mut wanted_class = None;
 
