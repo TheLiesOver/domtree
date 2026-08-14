@@ -588,7 +588,7 @@ fn ancestor_path(node: &Handle) -> Vec<ElementInfo> {
         if let Some(info) = element_info(&n) {
             result.push(info);
         }
-        current = n.parent.clone().and_then(|p| p.upgrade());
+        current = n.parent.get().and_then(|p| p.upgrade());
     }
 
     result.reverse();
