@@ -380,11 +380,11 @@ fn print_stats(root: &Handle) {
     println!();
 }
 
-fn attr(info: &ElementInfo, name: &str) -> Option<String> {
+fn attr<'a>(info: &'a ElementInfo, name: &str) -> Option<&'a str> {
     info.attrs
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
+        .map(|(_, v)| v.as_str())
 }
 
 fn print_forms(root: &Handle, color: bool) {
@@ -397,8 +397,8 @@ fn print_forms(root: &Handle, color: bool) {
         if let Some(info) = element_info(n) {
             if info.tag == "form" {
                 count += 1;
-                let method = attr(&info, "method").unwrap_or_else(|| "GET".to_string());
-                let action = attr(&info, "action").unwrap_or_else(|| "(current URL)".to_string());
+                let method = attr(&info, "method").unwrap_or("GET");
+                let action = attr(&info, "action").unwrap_or("(current URL)");
                 println!("FORM #{}", count);
                 println!("  method : {}", method.to_uppercase());
                 println!("  action : {action}");
@@ -413,8 +413,8 @@ fn print_forms(root: &Handle, color: bool) {
                 });
 
                 for input in inputs {
-                    let name = attr(&input, "name").unwrap_or_else(|| "(unnamed)".to_string());
-                    let typ = attr(&input, "type").unwrap_or_else(|| input.tag.clone());
+                    let name = attr(&input, "name").unwrap_or("(unnamed)");
+                    let typ = attr(&input, "type").unwrap_or(&input.tag);
                     println!("    ├── {name} [{typ}]");
                 }
                 println!();
@@ -548,21 +548,30 @@ fn matches_query(info: &ElementInfo, q: &str) -> bool {
         return info.classes.iter().any(|c| c == class);
     }
 
-    let mut tag = q;
+    let mut rest = q;
+    let mut wanted_tag = None;
     let mut wanted_id = None;
     let mut wanted_class = None;
 
-    if let Some(pos) = tag.find('#') {
-        wanted_id = Some(&tag[pos + 1..]);
-        tag = &tag[..pos];
-    }
-    if let Some(pos) = tag.find('.') {
-        wanted_class = Some(&tag[pos + 1..]);
-        tag = &tag[..pos];
+    if let Some((t, r)) = rest.split_once('#') {
+        wanted_tag = if !t.is_empty() { Some(t) } else { None };
+        if let Some((i, c)) = r.split_once('.') {
+            wanted_id = Some(i);
+            wanted_class = Some(c);
+        } else {
+            wanted_id = Some(r);
+        }
+    } else if let Some((t, c)) = rest.split_once('.') {
+        wanted_tag = if !t.is_empty() { Some(t) } else { None };
+        wanted_class = Some(c);
+    } else {
+        wanted_tag = Some(rest);
     }
 
-    if !tag.is_empty() && !info.tag.eq_ignore_ascii_case(tag) {
-        return false;
+    if let Some(tag) = wanted_tag {
+        if !info.tag.eq_ignore_ascii_case(tag) {
+            return false;
+        }
     }
 
     if let Some(id) = wanted_id {
@@ -588,11 +597,10 @@ fn ancestor_path(node: &Handle) -> Vec<ElementInfo> {
         if let Some(info) = element_info(&n) {
             result.push(info);
         }
-
-        current = n
-            .parent
-            .get()
-            .and_then(|p| p.upgrade());
+        
+        let parent = n.parent.take();
+        current = parent.as_ref().and_then(|p| p.upgrade());
+        n.parent.set(parent);
     }
 
     result.reverse();
