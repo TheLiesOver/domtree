@@ -125,15 +125,18 @@ domtree page.html --comments
 
 ## Author
 
+**MTX**
+
+## License
+
+MIT
+
+
 ## Prerequisites 
 
 Make sure you have Rust installed and set to the stable toolchain:
 
 ```bash
 rustup default stable
+```
 
-**MTX**
-
-## License
-
-MIT
