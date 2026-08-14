@@ -125,6 +125,13 @@ domtree page.html --comments
 
 ## Author
 
+## Prerequisites 
+
+Make sure you have Rust installed and set to the stable toolchain:
+
+```bash
+rustup default stable
+
 **MTX**
 
 ## License
