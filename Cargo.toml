@@ -1,6 +1,6 @@
 [package]
 name = "domtree"
-version = "2.0.0"
+version = "0.0.7"
 edition = "2021"
 authors = ["MTX"]
 description = "Fast Rust CLI for rendering and analyzing HTML DOM trees"
